@@ -4,7 +4,7 @@ import ..Compiler: verify_typeinf_trim, NativeInterpreter, argtypes_to_type, com
 
 using ..Compiler:
      # operators
-     !, !=, !==, +, :, <, <=, ==, =>, >, >=, ∈, ∉,
+     !, !=, !==, %, -, +, :, <, <=, ==, =>, >, >=, ^, ∈, ∉,
      # types
      Array, Builtin, Callable, Cint, CodeInfo, CodeInstance, Csize_t, Exception,
      GenericMemory, GlobalRef, IdDict, IdSet, IntrinsicFunction, Method, MethodInstance,
@@ -19,7 +19,7 @@ using ..Compiler:
      # misc
      @nospecialize, @assert, C_NULL
 using ..IRShow: LineInfoNode, print, show, println, append_scopes!, IOContext, IO, normalize_method_name
-using ..Base: Base, sourceinfo_slotnames
+using ..Base: Base, sourceinfo_slotnames, printstyled
 using ..Base.StackTraces: StackFrame
 
 ## declarations ##
@@ -49,76 +49,223 @@ const runtime_functions = Symbol[
 
 ## code for pretty printing ##
 
-# wrap a statement in a typeassert for printing clarity, unless that info seems already obvious
-function mapssavaluetypes(codeinfo::CodeInfo, sptypes::Vector{VarState}, stmt)
-    @nospecialize stmt
-    newstmt = mapssavalues(codeinfo, sptypes, stmt)
-    typ = widenconst(argextype(stmt, codeinfo, sptypes))
-    if newstmt isa Expr
-        if newstmt.head ∈ (:quote, :inert)
-            return newstmt
+# Check if a union is small with concrete types (same logic as code_warntype's is_expected_union)
+function is_expected_union(@nospecialize(u::Union))
+    Base.unionlen(u) < 4 || return false
+    for x in Base.uniontypes(u)
+        if !isdispatchelem(x) || x == Core.Box
+            return false
         end
-    elseif newstmt isa GlobalRef && isdispatchelem(typ)
-        return newstmt
-    elseif newstmt isa Union{Int, UInt8, UInt16, UInt32, UInt64, Float16, Float32, Float64, String, QuoteNode}
-        return newstmt
-    elseif newstmt isa Callable
-        return newstmt
     end
-    return Expr(:(::), newstmt, typ)
+    return true
 end
 
-# map the ssavalues in a (value-producing) statement to the expression they came from, summarizing some things to avoid excess printing
-function mapssavalues(codeinfo::CodeInfo, sptypes::Vector{VarState}, stmt)
-    @nospecialize stmt
-    if stmt isa SSAValue
-        return mapssavalues(codeinfo, sptypes, codeinfo.code[stmt.id])
-    elseif stmt isa PiNode
-        return mapssavalues(codeinfo, sptypes, stmt.val)
+# Check if a type is "stable" - uses same classification as code_warntype
+function is_type_stable(@nospecialize(typ))
+    typ isa Core.Const && return true
+    typ === Union{} && return false
+    typ == Core.Box && return false
+    typ isa Union && return is_expected_union(typ)
+    return isdispatchelem(typ)
+end
+
+# Color printing for types - same colors as code_warntype:
+# - red bold: unstable/abstract types
+# - yellow: expected unions (small unions of concrete types)
+# - light_black: stable concrete types
+function print_type_colored(io::IO, @nospecialize(typ))
+    color = get(io, :color, false)::Bool
+    if !color
+        print(io, typ)
+    elseif typ === Union{}
+        printstyled(io, typ; color=:red)
+    elseif typ == Core.Box
+        printstyled(io, typ; color=:red, bold=true)
+    elseif typ isa Union && is_expected_union(typ)
+        printstyled(io, typ; color=:yellow)
+    elseif isdispatchelem(typ)
+        printstyled(io, typ; color=:light_black)
+    else
+        printstyled(io, typ; color=:red, bold=true)
+    end
+end
+
+# Print with light_black if stable, normal otherwise
+function print_styled(io::IO, @nospecialize(x), stable::Bool)
+    stable ? printstyled(io, x; color=:light_black) : print(io, x)
+end
+
+# Check if we should elide the type annotation for a statement
+function should_elide_type(newstmt, @nospecialize(typ))
+    newstmt isa Expr && newstmt.head ∈ (:quote, :inert) && return true
+    newstmt isa GlobalRef && isdispatchelem(typ) && return true
+    newstmt isa Union{Int, UInt8, UInt16, UInt32, UInt64, Float16, Float32, Float64, String, QuoteNode} && return true
+    newstmt isa Callable && return true
+    return false
+end
+
+# Unwrap SSAValue and PiNode to get the underlying statement
+function unwrap_stmt(codeinfo::CodeInfo, @nospecialize(stmt))
+    while true
+        if stmt isa SSAValue
+            stmt = codeinfo.code[stmt.id]
+            isexpr(stmt, :(=)) && (stmt = stmt.args[2])
+        elseif stmt isa PiNode
+            stmt = stmt.val
+        else
+            return stmt
+        end
+    end
+end
+
+# Convert Core.Argument to slot name symbol if available
+function argument_name(codeinfo::CodeInfo, arg::Core.Argument)
+    slotnames = codeinfo.slotnames
+    if slotnames !== nothing && arg.n <= length(slotnames)
+        return slotnames[arg.n]
+    end
+    return arg
+end
+
+# Map IR nodes to printable expressions: unwrap SSAValues/PiNodes, convert Arguments to
+# slot names, simplify PhiNodes, and add type annotations to call arguments
+function mapssavalues(codeinfo::CodeInfo, sptypes::Vector{VarState}, @nospecialize(stmt))
+    stmt = unwrap_stmt(codeinfo, stmt)
+    if stmt isa Core.Argument
+        return argument_name(codeinfo, stmt)
     elseif stmt isa Expr
         stmt.head ∈ (:quote, :inert) && return stmt
-        newstmt = Expr(stmt.head)
         if stmt.head === :foreigncall
             return Expr(:call, :ccall, mapssavalues(codeinfo, sptypes, stmt.args[1]))
         elseif stmt.head ∉ (:new, :method, :toplevel, :thunk)
+            newstmt = Expr(stmt.head)
             newstmt.args = map!(similar(stmt.args), stmt.args) do arg
                 @nospecialize arg
-                return mapssavaluetypes(codeinfo, sptypes, arg)
+                newarg = mapssavalues(codeinfo, sptypes, arg)
+                typ = widenconst(argextype(arg, codeinfo, sptypes))
+                should_elide_type(newarg, typ) ? newarg : Expr(:(::), newarg, typ)
             end
             if newstmt.head === :invoke
-                # why is the fancy printing for this not in show_unquoted?
                 popfirst!(newstmt.args)
                 newstmt.head = :call
             end
+            return newstmt
         end
-        return newstmt
-    elseif stmt isa PhiNode
-        return PhiNode()
-    elseif stmt isa PhiCNode
-        return PhiNode()
+        return Expr(stmt.head)
+    elseif stmt isa PhiNode || stmt isa PhiCNode
+        return Expr(:call, Symbol("φ "))
     end
     return stmt
 end
 
-function verify_print_stmt(io::IOContext{IO}, codeinfo::CodeInfo, sptypes::Vector{VarState}, stmtidx::Int)
-    if codeinfo.slotnames !== nothing
-        io = IOContext(io, :SOURCE_SLOTNAMES => sourceinfo_slotnames(codeinfo))
+# Colors for matching parentheses at different nesting levels
+const PAREN_COLORS = (:blue, :yellow, :magenta, :cyan, :green)
+const MAX_NESTING_DEPTH = 2
+
+# Check if any argument in a call is type-unstable
+function has_unstable_arg(codeinfo::CodeInfo, sptypes::Vector{VarState}, args, startidx::Int)
+    for i in (startidx + 1):length(args)
+        argtyp = widenconst(argextype(args[i], codeinfo, sptypes))
+        is_type_stable(argtyp) || return true
     end
-    print(io, mapssavaluetypes(codeinfo, sptypes, SSAValue(stmtidx)))
+    return false
 end
 
-function verify_print_error(io::IOContext{IO}, desc::CallMissing, parents::ParentMap)
+# Print expression with colored types and rainbow parentheses for calls.
+# Non-call nodes (Arguments, GlobalRefs, literals, PhiNodes) use mapssavalues fallback.
+# depth tracks call nesting level for paren colors.
+function print_stmt_colored(io::IO, codeinfo::CodeInfo, sptypes::Vector{VarState}, @nospecialize(stmt);
+                            depth::Int=0, stable::Bool=false, indent::Int=0)
+    stmt = unwrap_stmt(codeinfo, stmt)
+    paren_color = PAREN_COLORS[(depth % length(PAREN_COLORS)) + 1]
+
+    if stmt isa Expr && stmt.head ∈ (:call, :invoke, :foreigncall)
+        # Handle function calls with colored arguments
+        if stmt.head === :foreigncall
+            print_styled(io, "ccall", stable)
+            printstyled(io, "("; color=paren_color)
+            length(stmt.args) >= 1 && print_styled(io, mapssavalues(codeinfo, sptypes, stmt.args[1]), stable)
+            printstyled(io, ")"; color=paren_color)
+        else
+            startidx = stmt.head === :invoke ? 2 : 1
+            # Print function name with type if not obvious, wrapped in parens if typed
+            if startidx <= length(stmt.args)
+                farg = stmt.args[startidx]
+                fstmt = mapssavalues(codeinfo, sptypes, farg)
+                ftyp = widenconst(argextype(farg, codeinfo, sptypes))
+                needs_type = !should_elide_type(fstmt, ftyp)
+                needs_type && printstyled(io, "("; color=paren_color)
+                print_styled(io, fstmt, stable)
+                if needs_type
+                    printstyled(io, "::"; color=:light_black)
+                    print_type_colored(io, ftyp)
+                    printstyled(io, ")"; color=paren_color)
+                end
+            end
+            printstyled(io, "("; color=paren_color)
+            # Use multiline if there are unstable args
+            nargs = length(stmt.args) - startidx
+            use_multiline = !stable && nargs > 0 && has_unstable_arg(codeinfo, sptypes, stmt.args, startidx)
+            # Print arguments - nested calls increment depth for their own parens
+            for i in (startidx + 1):length(stmt.args)
+                arg = stmt.args[i]
+                argtyp = widenconst(argextype(arg, codeinfo, sptypes))
+                arg_stable = is_type_stable(argtyp)
+                i > startidx + 1 && print(io, ",")
+                if use_multiline
+                    println(io)
+                    print(io, "  " ^ (indent + 1))
+                elseif i > startidx + 1
+                    print(io, " ")
+                end
+                # Fold deeply nested stable args
+                if arg_stable && depth >= MAX_NESTING_DEPTH
+                    printstyled(io, "…"; color=:light_black)
+                else
+                    # depth+1 for nested calls so their parens have different color
+                    print_stmt_colored(io, codeinfo, sptypes, arg; depth=depth+1, stable=arg_stable, indent=indent+1)
+                end
+                printstyled(io, "::"; color=:light_black)
+                print_type_colored(io, argtyp)
+            end
+            use_multiline && nargs > 0 && (println(io); print(io, "  " ^ indent))
+            printstyled(io, ")"; color=paren_color)
+        end
+    else
+        # Non-call: Arguments, GlobalRefs, literals, PhiNodes, etc.
+        print_styled(io, mapssavalues(codeinfo, sptypes, stmt), stable)
+    end
+end
+
+function verify_print_stmt(io::IO, codeinfo::CodeInfo, sptypes::Vector{VarState}, stmtidx::Int)
+    codeinfo.slotnames !== nothing && (io = IOContext(io, :SOURCE_SLOTNAMES => sourceinfo_slotnames(codeinfo)))
+    stmt = unwrap_stmt(codeinfo, codeinfo.code[stmtidx])
+    typ = widenconst(argextype(SSAValue(stmtidx), codeinfo, sptypes))
+    print_stmt_colored(io, codeinfo, sptypes, stmt)
+    print(io, "::")
+    print_type_colored(io, typ)
+end
+
+function verify_print_error(io::IO, desc::CallMissing, parents::ParentMap, warn::Bool)
     (; codeinst, codeinfo, sptypes, stmtidx, desc) = desc
     frames = verify_create_stackframes(codeinst, stmtidx, parents)
-    print(io, desc, " from statement ")
+    color = warn ? Base.warn_color() : Base.error_color()
+    printstyled(io, desc; color=color, bold=true)
+    print(io, " from statement ")
     verify_print_stmt(io, codeinfo, sptypes, stmtidx)
     Base.show_backtrace(io, frames)
     print(io, "\n\n")
     nothing
 end
 
-function verify_print_error(io::IOContext{IO}, desc::CCallableMissing, ::ParentMap)
-    print(io, desc.desc, " for ", desc.sig, " => ", desc.rt, "\n\n")
+function verify_print_error(io::IO, desc::CCallableMissing, ::ParentMap, warn::Bool)
+    color = warn ? Base.warn_color() : Base.error_color()
+    printstyled(io, desc.desc; color=color, bold=true)
+    print(io, " for ")
+    print_type_colored(io, desc.sig)
+    print(io, " => ")
+    print_type_colored(io, desc.rt)
+    print(io, "\n\n")
     nothing
 end
 
@@ -377,9 +524,13 @@ function verify_typeinf_trim(io::IO, codeinfos::Vector{Any}, onlywarn::Bool)
         warn, desc = desc
         severity = warn ? 2 : 1
         no = (counts[severity] += 1)
-        print(io, warn ? "Verifier warning #" : "Verifier error #", no, ": ")
+        if warn
+            printstyled(io, "Verifier warning #", no, ": "; color=Base.warn_color(), bold=true)
+        else
+            printstyled(io, "Verifier error #", no, ": "; color=Base.error_color(), bold=true)
+        end
         # TODO: should we coalesce any of these stacktraces to minimize spew?
-        verify_print_error(io, desc, parents)
+        verify_print_error(io, desc, parents, warn)
     end
 
     ## TODO: compute and display the minimum and/or full call graph instead of merely the first parent stacktrace?
@@ -392,11 +543,19 @@ function verify_typeinf_trim(io::IO, codeinfos::Vector{Any}, onlywarn::Bool)
 
     let severity = 0
         if counts[1] > 0 || counts[2] > 0
-            print("Trim verify finished with ")
-            print(counts[1], counts[1] == 1 ? " error" : " errors")
-            print(", ")
-            print(counts[2], counts[2] == 1 ? " warning" : " warnings")
-            print(".\n")
+            print(io, "Trim verify finished with ")
+            if counts[1] > 0
+                printstyled(io, counts[1], counts[1] == 1 ? " error" : " errors"; color=Base.error_color(), bold=true)
+            else
+                print(io, counts[1], counts[1] == 1 ? " error" : " errors")
+            end
+            print(io, ", ")
+            if counts[2] > 0
+                printstyled(io, counts[2], counts[2] == 1 ? " warning" : " warnings"; color=Base.warn_color(), bold=true)
+            else
+                print(io, counts[2], counts[2] == 1 ? " warning" : " warnings")
+            end
+            print(io, ".\n")
             severity = 2
         end
         if counts[1] > 0
